@@ -18,7 +18,18 @@ data/
 # Environment variables
 .env
 
+# Personal WhatsApp data
+contacts.json
+groups.json
+
+# Claude config (may contain local paths)
+.claude/
+
 # OS generated files
 .DS_Store
 Thumbs.db
+nul
+
+# IDE
 .roo
+.cursor/

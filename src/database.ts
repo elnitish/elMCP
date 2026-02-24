@@ -75,6 +75,9 @@ export function initializeDatabase(): DatabaseSync {
     `CREATE INDEX IF NOT EXISTS idx_chats_last_message_time ON chats (last_message_time);`,
   );
 
+  // Fix corrupted "undefined" strings written by earlier bug
+  db.exec(`UPDATE chats SET last_message_time = NULL WHERE last_message_time = 'undefined'`);
+
   return db;
 }
 
@@ -85,7 +88,7 @@ export function storeChat(chat: Partial<Chat> & { jid: string }): void {
             INSERT INTO chats (jid, name, last_message_time)
             VALUES (@jid, @name, @last_message_time)
             ON CONFLICT(jid) DO UPDATE SET
-                name = COALESCE(excluded.name, name),
+                name = CASE WHEN excluded.name IS NOT NULL THEN excluded.name ELSE name END,
                 last_message_time = COALESCE(excluded.last_message_time, last_message_time)
         `);
     stmt.run({
@@ -94,9 +97,7 @@ export function storeChat(chat: Partial<Chat> & { jid: string }): void {
       last_message_time:
         chat.last_message_time instanceof Date
           ? chat.last_message_time.toISOString()
-          : chat.last_message_time === null
-            ? null
-            : String(chat.last_message_time),
+          : null,
     });
   } catch (error) {
     console.error("Error storing chat:", error);

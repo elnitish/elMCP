@@ -1,7 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { jidNormalizedUser } from "@whiskeysockets/baileys";
+import { jidNormalizedUser, isJidGroup } from "@whiskeysockets/baileys";
+import fs from "node:fs";
+import path from "node:path";
 
 import {
   type Message as DbMessage,
@@ -14,8 +16,131 @@ import {
   searchMessages,
 } from "./database.ts";
 
-import { sendWhatsAppMessage, type WhatsAppSocket } from "./whatsapp.ts";
+import {
+  sendWhatsAppMessage,
+  sendWhatsAppMedia,
+  replyToWhatsAppMessage,
+  sendWhatsAppReaction,
+  markWhatsAppChatAsRead,
+  getWhatsAppGroupMembers,
+  syncContactsFromSock,
+  type WhatsAppSocket,
+} from "./whatsapp.ts";
 import { type P } from "pino";
+
+// Load contacts.json once at startup for case-insensitive name fallback
+const CONTACTS_JSON_PATH = path.join(import.meta.dirname, "..", "contacts.json");
+type ContactEntry = { "Display Name"?: string; "Mobile Phone"?: string; "First Name"?: string; "Last Name"?: string };
+let contactsJsonCache: ContactEntry[] | null = null;
+function getContactsJson(): ContactEntry[] {
+  if (!contactsJsonCache) {
+    try {
+      contactsJsonCache = JSON.parse(fs.readFileSync(CONTACTS_JSON_PATH, "utf8")) as ContactEntry[];
+    } catch {
+      contactsJsonCache = [];
+    }
+  }
+  return contactsJsonCache;
+}
+
+/** Case-insensitive search in contacts.json. Returns a phone-based JID or null. */
+function searchContactsJson(query: string): string | null {
+  const lower = query.toLowerCase();
+  const contacts = getContactsJson();
+  const match = contacts.find((c) => {
+    const name = (c["Display Name"] || `${c["First Name"] || ""} ${c["Last Name"] || ""}`.trim()).toLowerCase();
+    return name.includes(lower);
+  });
+  if (!match?.["Mobile Phone"]) return null;
+  const digits = match["Mobile Phone"].replace(/\D/g, "");
+  if (!digits) return null;
+  return `${digits}@s.whatsapp.net`;
+}
+
+// Load groups.json once at startup for case-insensitive group name lookup
+const GROUPS_JSON_PATH = path.join(import.meta.dirname, "..", "groups.json");
+type GroupEntry = { name: string; jid: string };
+let groupsJsonCache: GroupEntry[] | null = null;
+function getGroupsJson(): GroupEntry[] {
+  if (!groupsJsonCache) {
+    try {
+      groupsJsonCache = JSON.parse(fs.readFileSync(GROUPS_JSON_PATH, "utf8")) as GroupEntry[];
+    } catch {
+      groupsJsonCache = [];
+    }
+  }
+  return groupsJsonCache;
+}
+
+/** Case-insensitive search in groups.json. Returns the group JID or null. */
+function searchGroupsJson(query: string): { jid: string; name: string }[] {
+  const lower = query.toLowerCase();
+  return getGroupsJson().filter((g) => g.name.toLowerCase().includes(lower));
+}
+
+/**
+ * Resolves a recipient string (name or JID) to a normalized JID.
+ * - If it already contains "@", treat as JID directly.
+ * - Otherwise, search contacts DB by name/phone and resolve.
+ * - Falls back to contacts.json (case-insensitive) for individual contacts.
+ * - Falls back to groups.json (case-insensitive) for group names.
+ * Returns { jid } on success, or { error } on failure.
+ */
+function resolveRecipient(
+  recipient: string
+): { jid: string; error?: never } | { error: string; jid?: never } {
+  // Already looks like a JID
+  if (recipient.includes("@")) {
+    try {
+      // Group JIDs (@g.us) must NOT be passed through jidNormalizedUser — pass them as-is
+      if (isJidGroup(recipient)) {
+        return { jid: recipient };
+      }
+      const jid = jidNormalizedUser(recipient);
+      return { jid };
+    } catch {
+      return { error: `Invalid JID format: "${recipient}"` };
+    }
+  }
+
+  // Could be a plain phone number — try appending @s.whatsapp.net
+  if (/^\+?\d[\d\s\-]{6,}$/.test(recipient)) {
+    const digits = recipient.replace(/\D/g, "");
+    return { jid: `${digits}@s.whatsapp.net` };
+  }
+
+  // Treat as a contact name — search the DB (already case-insensitive via LOWER())
+  const matches = searchDbForContacts(recipient, 10);
+  if (matches.length === 0) {
+    // DB had no match — try contacts.json (case-insensitive) for individual contacts
+    const jidFromJson = searchContactsJson(recipient);
+    if (jidFromJson) {
+      return { jid: jidFromJson };
+    }
+    // Try groups.json (case-insensitive) for group names
+    const groupMatches = searchGroupsJson(recipient);
+    if (groupMatches.length === 1) {
+      return { jid: groupMatches[0].jid };
+    }
+    if (groupMatches.length > 1) {
+      const list = groupMatches.map((g) => `• ${g.name} → ${g.jid}`).join("\n");
+      return { error: `Multiple groups match "${recipient}". Please be more specific:\n${list}` };
+    }
+    return {
+      error: `No contact or group found with name "${recipient}". Try using a phone number or full JID instead.`,
+    };
+  }
+  if (matches.length === 1) {
+    return { jid: matches[0].jid };
+  }
+  // Multiple matches — list them for the user
+  const list = matches
+    .map((c) => `• ${c.name ?? "Unknown"} → ${c.jid}`)
+    .join("\n");
+  return {
+    error: `Multiple contacts match "${recipient}". Please be more specific or use a JID directly:\n${list}`,
+  };
+}
 
 function formatDbMessageForJson(msg: DbMessage) {
   return {
@@ -391,7 +516,7 @@ export async function startMcpServer(
       recipient: z
         .string()
         .describe(
-          "Recipient JID (user or group, e.g., '12345@s.whatsapp.net' or 'group123@g.us')",
+          "Recipient: contact name (e.g., 'Rahul'), phone number (e.g., '919919003141'), or JID (e.g., '919919003141@s.whatsapp.net')",
         ),
       message: z.string().min(1).describe("The text message to send"),
     },
@@ -409,26 +534,15 @@ export async function startMcpServer(
         };
       }
 
-      let normalizedRecipient: string;
-      try {
-        normalizedRecipient = jidNormalizedUser(recipient);
-        if (!normalizedRecipient.includes("@")) {
-          throw new Error('JID must contain "@" symbol');
-        }
-      } catch (normError: any) {
-        mcpLogger.error(
-          `[MCP Tool Error] Invalid recipient JID format: ${recipient}. Error: ${normError.message}`,
-        );
+      const resolved = resolveRecipient(recipient);
+      if (resolved.error) {
+        mcpLogger.error(`[MCP Tool Error] send_message resolve failed: ${resolved.error}`);
         return {
           isError: true,
-          content: [
-            {
-              type: "text",
-              text: `Invalid recipient format: "${recipient}". Please provide a valid JID (e.g., number@s.whatsapp.net or group@g.us).`,
-            },
-          ],
+          content: [{ type: "text", text: resolved.error }],
         };
       }
+      const normalizedRecipient = resolved.jid!;
 
       try {
         const result = await sendWhatsAppMessage(
@@ -549,6 +663,289 @@ export async function startMcpServer(
               text: `Error searching messages in chat ${chat_jid}: ${error.message}`,
             },
           ],
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "send_media",
+    {
+      recipient: z
+        .string()
+        .describe("Recipient: contact name (e.g., 'Rahul'), phone number, or JID (e.g., '12345@s.whatsapp.net')"),
+      media_type: z
+        .enum(["image", "video", "document", "audio"])
+        .describe("Type of media to send"),
+      media_path: z
+        .string()
+        .describe("Absolute local file path to the media file (e.g., 'C:/Users/you/image.png')"),
+      caption: z
+        .string()
+        .optional()
+        .describe("Optional caption for image, video, or document"),
+      file_name: z
+        .string()
+        .optional()
+        .describe("Optional filename override (used for documents)"),
+    },
+    async ({ recipient, media_type, media_path, caption, file_name }) => {
+      mcpLogger.info(`[MCP Tool] Executing send_media to ${recipient}, type=${media_type}`);
+      if (!sock) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: WhatsApp connection is not active." }],
+        };
+      }
+      const resolved = resolveRecipient(recipient);
+      if (resolved.error) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: resolved.error }],
+        };
+      }
+      const normalizedRecipient = resolved.jid!;
+      try {
+        const result = await sendWhatsAppMedia(
+          waLogger, sock, normalizedRecipient, media_type, media_path, caption, file_name
+        );
+        if (result?.key?.id) {
+          return {
+            content: [{ type: "text", text: `Media sent successfully to ${normalizedRecipient} (ID: ${result.key.id}).` }],
+          };
+        }
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Failed to send media to ${normalizedRecipient}.` }],
+        };
+      } catch (error: any) {
+        mcpLogger.error(`[MCP Tool Error] send_media failed: ${error.message}`);
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Error sending media: ${error.message}` }],
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "reply_to_message",
+    {
+      message_id: z
+        .string()
+        .describe("The ID of the message to reply to"),
+      reply_text: z
+        .string()
+        .min(1)
+        .describe("The reply text to send"),
+    },
+    async ({ message_id, reply_text }) => {
+      mcpLogger.info(`[MCP Tool] Executing reply_to_message for msg ${message_id}`);
+      if (!sock) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: WhatsApp connection is not active." }],
+        };
+      }
+      const context = getMessagesAround(message_id, 0, 0);
+      if (!context.target) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Message with ID ${message_id} not found in local database.` }],
+        };
+      }
+      const { target } = context;
+      try {
+        const result = await replyToWhatsAppMessage(
+          waLogger,
+          sock,
+          target.chat_jid,
+          target.id,
+          target.content,
+          target.sender ?? null,
+          target.is_from_me,
+          reply_text
+        );
+        if (result?.key?.id) {
+          return {
+            content: [{ type: "text", text: `Reply sent successfully (ID: ${result.key.id}).` }],
+          };
+        }
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Failed to send reply." }],
+        };
+      } catch (error: any) {
+        mcpLogger.error(`[MCP Tool Error] reply_to_message failed: ${error.message}`);
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Error sending reply: ${error.message}` }],
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "send_reaction",
+    {
+      message_id: z
+        .string()
+        .describe("The ID of the message to react to"),
+      emoji: z
+        .string()
+        .describe("The emoji to react with (e.g., '👍', '❤️'). Use empty string '' to remove reaction."),
+    },
+    async ({ message_id, emoji }) => {
+      mcpLogger.info(`[MCP Tool] Executing send_reaction for msg ${message_id}, emoji=${emoji}`);
+      if (!sock) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: WhatsApp connection is not active." }],
+        };
+      }
+      const context = getMessagesAround(message_id, 0, 0);
+      if (!context.target) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Message with ID ${message_id} not found in local database.` }],
+        };
+      }
+      const { target } = context;
+      try {
+        await sendWhatsAppReaction(
+          waLogger,
+          sock,
+          target.chat_jid,
+          target.id,
+          target.sender ?? null,
+          target.is_from_me,
+          emoji
+        );
+        return {
+          content: [{ type: "text", text: `Reaction "${emoji}" sent successfully on message ${message_id}.` }],
+        };
+      } catch (error: any) {
+        mcpLogger.error(`[MCP Tool Error] send_reaction failed: ${error.message}`);
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Error sending reaction: ${error.message}` }],
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "mark_as_read",
+    {
+      chat_jid: z
+        .string()
+        .describe("The JID of the chat to mark as read (e.g., '12345@s.whatsapp.net' or 'group@g.us')"),
+    },
+    async ({ chat_jid }) => {
+      mcpLogger.info(`[MCP Tool] Executing mark_as_read for chat ${chat_jid}`);
+      if (!sock) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: WhatsApp connection is not active." }],
+        };
+      }
+      const messages = getMessages(chat_jid, 1, 0);
+      if (!messages.length) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `No messages found for chat ${chat_jid}.` }],
+        };
+      }
+      const lastMsg = messages[0];
+      try {
+        await markWhatsAppChatAsRead(
+          waLogger,
+          sock,
+          chat_jid,
+          lastMsg.id,
+          lastMsg.is_from_me,
+          lastMsg.sender ?? null
+        );
+        return {
+          content: [{ type: "text", text: `Chat ${chat_jid} marked as read.` }],
+        };
+      } catch (error: any) {
+        mcpLogger.error(`[MCP Tool Error] mark_as_read failed: ${error.message}`);
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Error marking chat as read: ${error.message}` }],
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "get_group_members",
+    {
+      group_jid: z
+        .string()
+        .describe("The JID of the WhatsApp group (e.g., '1234567890-1234567890@g.us')"),
+    },
+    async ({ group_jid }) => {
+      mcpLogger.info(`[MCP Tool] Executing get_group_members for group ${group_jid}`);
+      if (!sock) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: WhatsApp connection is not active." }],
+        };
+      }
+      if (!group_jid.endsWith("@g.us")) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Invalid group JID: "${group_jid}". Group JIDs must end with "@g.us".` }],
+        };
+      }
+      try {
+        const members = await getWhatsAppGroupMembers(waLogger, sock, group_jid);
+        if (!members.length) {
+          return {
+            content: [{ type: "text", text: `No members found for group ${group_jid} (or group does not exist).` }],
+          };
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify(members, null, 2) }],
+        };
+      } catch (error: any) {
+        mcpLogger.error(`[MCP Tool Error] get_group_members failed: ${error.message}`);
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Error getting group members: ${error.message}` }],
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "sync_contacts",
+    {},
+    async () => {
+      mcpLogger.info("[MCP Tool] Executing sync_contacts");
+      if (!sock) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: WhatsApp connection is not active." }],
+        };
+      }
+      try {
+        const count = syncContactsFromSock(waLogger, sock);
+        return {
+          content: [{
+            type: "text",
+            text: count > 0
+              ? `Synced ${count} contact names from WhatsApp into the local database. You can now search contacts by name.`
+              : "No contact names were found to sync. The contacts map may not be populated yet — try again in a few seconds after the connection has fully loaded.",
+          }],
+        };
+      } catch (error: any) {
+        mcpLogger.error(`[MCP Tool Error] sync_contacts failed: ${error.message}`);
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Error syncing contacts: ${error.message}` }],
         };
       }
     },

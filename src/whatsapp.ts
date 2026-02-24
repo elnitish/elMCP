@@ -5,12 +5,12 @@ import {
   makeCacheableSignalKeyStore,
   DisconnectReason,
   type WAMessage,
-  type proto,
   isJidGroup,
   jidNormalizedUser,
 } from "@whiskeysockets/baileys";
 import P from "pino";
 import path from "node:path";
+import fs from "node:fs";
 import open from "open";
 
 import {
@@ -98,6 +98,9 @@ export async function startWhatsAppConnection(
   const { version, isLatest } = await fetchLatestBaileysVersion();
   logger.info(`Using WA v${version.join(".")}, isLatest: ${isLatest}`);
 
+  // In-memory cache for group metadata to avoid redundant server fetches
+  const groupMetadataCache = new Map<string, any>();
+
   const sock = makeWASocket({
     version,
     logger,
@@ -106,7 +109,35 @@ export async function startWhatsAppConnection(
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
     generateHighQualityLinkPreview: true,
-    shouldIgnoreJid: (jid) => isJidGroup(jid),
+    cachedGroupMetadata: async (jid: string) => groupMetadataCache.get(jid),
+  });
+
+  // Populate cache when group metadata is fetched
+  sock.ev.on("groups.update", (updates) => {
+    for (const update of updates) {
+      if (update.id && groupMetadataCache.has(update.id)) {
+        groupMetadataCache.set(update.id, { ...groupMetadataCache.get(update.id), ...update });
+      }
+    }
+  });
+
+  // Wait for the connection to be fully open before returning
+  await new Promise<void>((resolve, reject) => {
+    const onUpdate = (update: any) => {
+      const { connection, lastDisconnect } = update;
+      if (connection === "open") {
+        sock.ev.off("connection.update", onUpdate);
+        resolve();
+      } else if (connection === "close") {
+        const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+        if (statusCode === DisconnectReason.loggedOut) {
+          sock.ev.off("connection.update", onUpdate);
+          reject(new Error("Logged out"));
+        }
+        // otherwise keep waiting — Baileys will reconnect automatically
+      }
+    };
+    sock.ev.on("connection.update", onUpdate);
   });
 
   sock.ev.process(async (events) => {
@@ -143,6 +174,13 @@ export async function startWhatsAppConnection(
       } else if (connection === "open") {
         logger.info(`Connection opened. WA user: ${sock.user?.name}`);
         console.log("Logged as", sock.user?.name);
+        // Give Baileys a moment to populate sock.contacts, then sync names to DB
+        setTimeout(() => {
+          const count = syncContactsFromSock(logger, sock);
+          if (count > 0) {
+            logger.info(`Auto-synced ${count} contact names on connection open.`);
+          }
+        }, 3000);
       }
     }
 
@@ -157,13 +195,27 @@ export async function startWhatsAppConnection(
 
       chats.forEach((chat) =>
         storeChat({
-          jid: chat.id,
+          jid: chat.id ?? '',
           name: chat.name,
           last_message_time: chat.conversationTimestamp
             ? new Date(Number(chat.conversationTimestamp) * 1000)
             : undefined,
         })
       );
+
+      // Sync contact names from history
+      let contactCount = 0;
+      contacts.forEach((contact) => {
+        const name =
+          contact.name || contact.notify || contact.verifiedName || null;
+        if (contact.id && name) {
+          storeChat({ jid: contact.id, name });
+          contactCount++;
+        }
+      });
+      if (contactCount > 0) {
+        logger.info(`Synced ${contactCount} contact names from history.`);
+      }
 
       let storedCount = 0;
       messages.forEach((msg) => {
@@ -222,9 +274,67 @@ export async function startWhatsAppConnection(
         });
       }
     }
+
+    if (events["contacts.upsert"]) {
+      let synced = 0;
+      for (const contact of events["contacts.upsert"]) {
+        const name =
+          contact.name || contact.notify || contact.verifiedName || null;
+        if (contact.id && name) {
+          storeChat({ jid: contact.id, name });
+          synced++;
+        }
+      }
+      if (synced > 0) {
+        logger.info(`Synced ${synced} contacts from contacts.upsert.`);
+      }
+    }
+
+    if (events["contacts.update"]) {
+      let updated = 0;
+      for (const contact of events["contacts.update"]) {
+        const name =
+          contact.name || contact.notify || contact.verifiedName || null;
+        if (contact.id && name) {
+          storeChat({ jid: contact.id, name });
+          updated++;
+        }
+      }
+      if (updated > 0) {
+        logger.info(`Updated ${updated} contact names from contacts.update.`);
+      }
+    }
   });
 
   return sock;
+}
+
+function getMimetype(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  const mimes: Record<string, string> = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".mp4": "video/mp4",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+    ".mov": "video/quicktime",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".pdf": "application/pdf",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".zip": "application/zip",
+    ".txt": "text/plain",
+  };
+  return mimes[ext] || "application/octet-stream";
 }
 
 export async function sendWhatsAppMessage(
@@ -232,7 +342,7 @@ export async function sendWhatsAppMessage(
   sock: WhatsAppSocket | null,
   recipientJid: string,
   text: string
-): Promise<proto.WebMessageInfo | void> {
+): Promise<WAMessage | void> {
   if (!sock || !sock.user) {
     logger.error(
       "Cannot send message: WhatsApp socket not connected or initialized."
@@ -248,16 +358,235 @@ export async function sendWhatsAppMessage(
     return;
   }
 
+  // For group JIDs, use as-is; for individual JIDs, normalize
+  const normalizedJid = isJidGroup(recipientJid)
+    ? recipientJid
+    : jidNormalizedUser(recipientJid);
+
+  logger.info(`Sending message to ${normalizedJid}: ${text.substring(0, 50)}...`);
+
+  // Attempt the send; for groups, retry once after a short delay.
+  // The first attempt may fail with "not-acceptable" (406) from assertSessions
+  // while WhatsApp establishes Signal sessions with participants. A retry
+  // typically succeeds because sessions are already cached by then.
+  const maxAttempts = isJidGroup(normalizedJid) ? 2 : 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const result = await sock.sendMessage(normalizedJid, { text: text });
+      logger.info({ msgId: result?.key.id }, "Message sent successfully");
+      return result;
+    } catch (error: any) {
+      const statusCode = error?.output?.statusCode ?? error?.data;
+      const isNotAcceptable = statusCode === 406 || error?.message === "not-acceptable";
+      if (isNotAcceptable && attempt < maxAttempts) {
+        logger.warn({ attempt }, "Got not-acceptable from assertSessions; retrying after session establishment...");
+        await new Promise(res => setTimeout(res, 2000));
+        continue;
+      }
+      logger.error({ err: error, recipientJid: normalizedJid }, "Failed to send message");
+      return;
+    }
+  }
+}
+
+export async function sendWhatsAppMedia(
+  logger: P.Logger,
+  sock: WhatsAppSocket | null,
+  recipientJid: string,
+  mediaType: "image" | "video" | "document" | "audio",
+  mediaPath: string,
+  caption?: string,
+  fileName?: string
+): Promise<WAMessage | void> {
+  if (!sock || !sock.user) {
+    logger.error("Cannot send media: WhatsApp socket not connected or initialized.");
+    return;
+  }
   try {
-    logger.info(
-      `Sending message to ${recipientJid}: ${text.substring(0, 50)}...`
-    );
+    const buffer = fs.readFileSync(mediaPath);
+    const mimetype = getMimetype(mediaPath);
+    const resolvedFileName = fileName || path.basename(mediaPath);
     const normalizedJid = jidNormalizedUser(recipientJid);
-    const result = await sock.sendMessage(normalizedJid, { text: text });
-    logger.info({ msgId: result?.key.id }, "Message sent successfully");
+    let messageContent: any;
+    switch (mediaType) {
+      case "image":
+        messageContent = { image: buffer, mimetype, caption };
+        break;
+      case "video":
+        messageContent = { video: buffer, mimetype, caption };
+        break;
+      case "audio":
+        messageContent = { audio: buffer, mimetype, ptt: false };
+        break;
+      case "document":
+        messageContent = { document: buffer, mimetype, fileName: resolvedFileName, caption };
+        break;
+    }
+    const result = await sock.sendMessage(normalizedJid, messageContent);
+    logger.info({ msgId: result?.key.id }, "Media sent successfully");
     return result;
   } catch (error) {
-    logger.error({ err: error, recipientJid }, "Failed to send message");
+    logger.error({ err: error, recipientJid }, "Failed to send media");
     return;
+  }
+}
+
+export async function replyToWhatsAppMessage(
+  logger: P.Logger,
+  sock: WhatsAppSocket | null,
+  chatJid: string,
+  quotedMessageId: string,
+  quotedContent: string,
+  quotedSenderJid: string | null,
+  quotedIsFromMe: boolean,
+  replyText: string
+): Promise<WAMessage | void> {
+  if (!sock || !sock.user) {
+    logger.error("Cannot reply: WhatsApp socket not connected or initialized.");
+    return;
+  }
+  try {
+    const normalizedJid = jidNormalizedUser(chatJid);
+    const quotedMsg = {
+      key: {
+        id: quotedMessageId,
+        remoteJid: normalizedJid,
+        fromMe: quotedIsFromMe,
+        participant: quotedSenderJid ?? undefined,
+      },
+      message: { conversation: quotedContent },
+    };
+    const result = await sock.sendMessage(
+      normalizedJid,
+      { text: replyText },
+      { quoted: quotedMsg as any }
+    );
+    logger.info({ msgId: result?.key.id }, "Reply sent successfully");
+    return result;
+  } catch (error) {
+    logger.error({ err: error, chatJid }, "Failed to send reply");
+    return;
+  }
+}
+
+export async function sendWhatsAppReaction(
+  logger: P.Logger,
+  sock: WhatsAppSocket | null,
+  chatJid: string,
+  messageId: string,
+  senderJid: string | null,
+  isFromMe: boolean,
+  emoji: string
+): Promise<void> {
+  if (!sock || !sock.user) {
+    logger.error("Cannot send reaction: WhatsApp socket not connected or initialized.");
+    return;
+  }
+  try {
+    const normalizedJid = jidNormalizedUser(chatJid);
+    await sock.sendMessage(normalizedJid, {
+      react: {
+        text: emoji,
+        key: {
+          remoteJid: normalizedJid,
+          id: messageId,
+          fromMe: isFromMe,
+          participant: senderJid ?? undefined,
+        },
+      },
+    });
+    logger.info({ messageId, emoji }, "Reaction sent successfully");
+  } catch (error) {
+    logger.error({ err: error, chatJid, messageId }, "Failed to send reaction");
+  }
+}
+
+export async function markWhatsAppChatAsRead(
+  logger: P.Logger,
+  sock: WhatsAppSocket | null,
+  chatJid: string,
+  lastMessageId: string,
+  lastMessageIsFromMe: boolean,
+  lastMessageSender: string | null
+): Promise<void> {
+  if (!sock || !sock.user) {
+    logger.error("Cannot mark as read: WhatsApp socket not connected or initialized.");
+    return;
+  }
+  try {
+    const normalizedJid = jidNormalizedUser(chatJid);
+    await sock.readMessages([{
+      remoteJid: normalizedJid,
+      id: lastMessageId,
+      fromMe: lastMessageIsFromMe,
+      participant: lastMessageSender ?? undefined,
+    }]);
+    logger.info({ chatJid }, "Chat marked as read");
+  } catch (error) {
+    logger.error({ err: error, chatJid }, "Failed to mark chat as read");
+  }
+}
+
+/**
+ * Reads Baileys' in-memory contacts map (sock.contacts) and persists any display
+ * names it finds into our SQLite chats table.  This is the most reliable way to
+ * populate human-readable names like "Dady" because WhatsApp delivers address-book
+ * names through the contacts map rather than through regular message events.
+ *
+ * Returns the number of contacts whose names were written to the DB.
+ */
+export function syncContactsFromSock(
+  logger: P.Logger,
+  sock: WhatsAppSocket | null
+): number {
+  if (!sock) return 0;
+  try {
+    // Baileys stores a contacts dictionary on the socket as a non-typed property
+    const contactsMap = (sock as any).contacts as
+      | Record<string, { name?: string; notify?: string; verifiedName?: string }>
+      | undefined;
+
+    if (!contactsMap || typeof contactsMap !== "object") {
+      logger.warn("syncContactsFromSock: sock.contacts is not available yet.");
+      return 0;
+    }
+
+    let synced = 0;
+    for (const [jid, contact] of Object.entries(contactsMap)) {
+      const name =
+        contact.name || contact.notify || contact.verifiedName || null;
+      if (jid && name) {
+        storeChat({ jid, name });
+        synced++;
+      }
+    }
+    logger.info(`syncContactsFromSock: wrote ${synced} contact names to DB.`);
+    return synced;
+  } catch (error) {
+    logger.error({ err: error }, "syncContactsFromSock failed");
+    return 0;
+  }
+}
+
+export async function getWhatsAppGroupMembers(
+  logger: P.Logger,
+  sock: WhatsAppSocket | null,
+  groupJid: string
+): Promise<Array<{ jid: string; phone: string; isAdmin: boolean; isSuperAdmin: boolean }>> {
+  if (!sock || !sock.user) {
+    logger.error("Cannot get group members: WhatsApp socket not connected or initialized.");
+    return [];
+  }
+  try {
+    const metadata = await sock.groupMetadata(groupJid);
+    return metadata.participants.map((p) => ({
+      jid: p.id,
+      phone: p.id.split("@")[0],
+      isAdmin: p.admin === "admin" || p.admin === "superadmin",
+      isSuperAdmin: p.admin === "superadmin",
+    }));
+  } catch (error) {
+    logger.error({ err: error, groupJid }, "Failed to get group members");
+    return [];
   }
 }
