@@ -31,7 +31,7 @@ Send and receive messages, search contacts, browse chat history, share media —
 ### 1. Clone & Install
 
 ```bash
-git clone https://github.com/nickshu/whatsapp-mcp-ts.git
+git clone https://github.com/elnitish/whatsapp-mcp-ts.git
 cd whatsapp-mcp-ts
 npm install
 ```
