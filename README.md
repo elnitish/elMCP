@@ -1,210 +1,287 @@
 # WhatsApp MCP Server (TypeScript/Baileys)
+
 [![smithery badge](https://smithery.ai/badge/@jlucaso1/whatsapp-mcp-ts)](https://smithery.ai/server/@jlucaso1/whatsapp-mcp-ts)
 
-This is a Model Context Protocol (MCP) server for WhatsApp, built with TypeScript and using the `@whiskeysockets/baileys` library.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that connects your personal WhatsApp account to AI agents like Claude, Cursor, or any MCP-compatible client.
 
-It allows you to connect your personal WhatsApp account to an AI agent (like Anthropic Claude via its desktop app or Cursor) enabling it to:
+Send and receive messages, search contacts, browse chat history, share media — all through natural language commands in your AI assistant.
 
-* Search your personal WhatsApp messages.
-* Search your contacts (individuals, not groups).
-* List your recent chats.
-* Retrieve message history for specific chats.
-* Send messages to individuals or groups.
+## What Can It Do?
 
-It connects directly to your **personal WhatsApp account** using the WhatsApp Web multi-device API. All your messages and authentication details are stored **locally** in a SQLite database (`./data/`) and authentication cache (`./auth_info/`). Data is only sent to the connected AI agent when it explicitly uses the provided MCP tools (which you control via the agent's interface).
+- **Send & receive messages** — text, images, videos, documents, audio
+- **Search contacts & groups** — case-insensitive, works by name or phone number
+- **Browse chat history** — paginated, sortable, filterable
+- **Reply & react** — quoted replies and emoji reactions
+- **Group support** — send to groups, list group members
+- **Message search** — full-text search across all chats
+- **Mark as read** — mark chats as read
+- **Sync contacts** — pull latest contact names from WhatsApp
 
-*(Optional: Consider adding a screenshot or GIF similar to the reference example here)*
+## Quick Start
 
-## Example
+### Prerequisites
 
-**User:**
-Send a whatsapp message to "Meu amor" in whatsapp saying "Te amo"
+- **Node.js 23.10.0+** — required for built-in SQLite support ([download](https://nodejs.org/))
+  ```bash
+  node -v  # must be >= 23.10.0
+  ```
+- **A WhatsApp account** on your phone
+- **An MCP-compatible AI client** — Claude Desktop, Claude Code, Cursor, Cline, or Roo Code
 
----
+### 1. Clone & Install
 
-**Assistant:**
-Okay, I need to find the contact first.
-*Using tool: `whatsapp.search_contacts`*
-```json
-{
-  "query": "Meu amor"
-}
+```bash
+git clone https://github.com/nickshu/whatsapp-mcp-ts.git
+cd whatsapp-mcp-ts
+npm install
 ```
 
----
+### 2. Link Your WhatsApp
 
-**Tool Result:**
+Run the server directly to perform initial setup:
+
+```bash
+node src/main.ts
+```
+
+This will:
+1. Generate a **QR code link** (opens automatically in your browser via `quickchart.io`)
+2. On your phone: open **WhatsApp → Settings → Linked Devices → Link a Device**
+3. Scan the QR code with your phone
+4. Wait for message history to sync (can take a few minutes for large accounts)
+
+Your credentials are saved to `./auth_info/` — you won't need to scan again unless you log out.
+
+> **Tip:** Check `wa-logs.txt` for sync progress. Once you see messages being stored, you're good to go.
+
+### 3. Connect to Your AI Client
+
+Add the server to your AI client's MCP configuration. Replace `<PATH>` with the absolute path to this repo.
+
+#### Claude Desktop
+
+Edit your config file:
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+- **Linux:** `~/.config/Claude/claude_desktop_config.json`
+
 ```json
-[
-  {
-    "jid": "5599xxxxxx@s.whatsapp.net",
-    "name": "Meu Amor"
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "node",
+      "args": ["<PATH>/src/main.ts"]
+    }
   }
-]
-```
-
----
-
-**Assistant:**
-Found the contact. Now sending the message.
-*Using tool: `whatsapp.send_message`*
-```json
-{
-  "recipient": "5599xxxxxx@s.whatsapp.net",
-  "message": "Te amo"
 }
 ```
 
----
+#### Claude Code
 
-**Tool Result:**
-```text
-Message sent successfully to 5599xxxxxx@s.whatsapp.net (ID: XXXXXXXXXXX).
+Edit `~/.claude.json` (global) or your project's `.claude/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "node",
+      "args": ["--import", "tsx/esm", "<PATH>/src/main.ts"]
+    }
+  }
+}
 ```
 
-## Key Features (MCP Tools)
+> **Note:** Claude Code requires `tsx` for TypeScript. Make sure `tsx` is installed (`npm install -g tsx` or use the project's local copy).
 
-The server exposes the following tools to the connected AI agent:
+#### Cursor
 
-* `search_contacts`: Search for contacts by name or phone number part (JID).
-* `list_messages`: Retrieve message history for a specific chat, with pagination.
-* `list_chats`: List your chats, sortable by activity or name, filterable, paginated, optionally includes last message details.
-* `get_chat`: Get detailed information about a specific chat.
-* `get_message_context`: Retrieve messages sent immediately before and after a specific message ID for context.
-* `send_message`: Send a text message to a specified recipient JID (user or group).
+Edit `~/.cursor/mcp.json`:
 
-## Installation
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "node",
+      "args": ["<PATH>/src/main.ts"]
+    }
+  }
+}
+```
 
-### Installing via Smithery
-
-To install WhatsApp MCP Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@jlucaso1/whatsapp-mcp-ts):
+#### Smithery (Auto-Install)
 
 ```bash
 npx -y @smithery/cli install @jlucaso1/whatsapp-mcp-ts --client claude
 ```
 
-### Prerequisites
+### 4. Restart Your AI Client
 
-* **Node.js:** Version 23.10.0 or higher (as specified in `package.json`). You can check your version with `node -v`. (Has initial typescript and sqlite builtin support)
-* **npm** (or yarn/pnpm): Usually comes with Node.js.
-* **AI Client:** Anthropic Claude Desktop app, Cursor, Cline or Roo Code (or another MCP-compatible client).
+Close and reopen your AI client. The WhatsApp MCP tools should now be available.
 
-### Steps
+## Available MCP Tools
 
-1.  **Clone this repository:**
-    ```bash
-    git clone <your-repo-url> whatsapp-mcp-ts
-    cd whatsapp-mcp-ts
-    ```
+| Tool | Description |
+|---|---|
+| `send_message` | Send a text message. Accepts contact name, phone number, or JID as recipient. |
+| `send_media` | Send an image, video, document, or audio file. Auto-detects MIME type. |
+| `reply_to_message` | Send a quoted reply to a specific message. |
+| `send_reaction` | React to a message with an emoji (or remove reaction with empty string). |
+| `search_contacts` | Search contacts by name or phone number. |
+| `list_chats` | List chats with sorting, filtering, and pagination. |
+| `get_chat` | Get details about a specific chat. |
+| `list_messages` | Get message history for a chat (paginated). |
+| `get_message_context` | Get messages before and after a specific message. |
+| `search_messages` | Full-text search across messages, optionally scoped to a chat. |
+| `get_group_members` | List members of a WhatsApp group. |
+| `mark_as_read` | Mark a chat as read. |
+| `sync_contacts` | Manually sync contact names from WhatsApp. |
 
-2.  **Install dependencies:**
-    ```bash
-    npm install
-    # or yarn install / pnpm install
-    ```
+### Smart Recipient Resolution
 
-3.  **Run the server for the first time:**
-    Use `node` to run the main script directly.
-    ```bash
-    node src/main.ts
-    ```
-    * The first time you run it, it will likely generate a QR code link using `quickchart.io` and attempt to open it in your default browser.
-    * Scan this QR code using your WhatsApp mobile app (Settings > Linked Devices > Link a Device).
-    * Authentication credentials will be saved locally in the `auth_info/` directory (this is ignored by git).
-    * Messages will start syncing and be stored in `./data/whatsapp.db`. This might take some time depending on your history size. Check the `wa-logs.txt` and console output for progress.
-    * Keep this terminal window running. After syncing you can close.
+When using `send_message` or `send_media`, you don't need to know JIDs. The server resolves recipients automatically:
 
-## Configuration for AI Client
+```
+"Dady"          → searches contacts by name (case-insensitive)
+"Family"        → searches groups by name (case-insensitive)
+"+91 99190 03141" → converts phone number to JID
+"919919003141@s.whatsapp.net" → uses JID directly
+```
 
-You need to tell your AI client how to start this MCP server.
+If multiple matches are found, you'll get a list to choose from.
 
-1.  **Prepare the configuration JSON:**
-    Copy the following JSON structure. You'll need to replace `{{PATH_TO_REPO}}` with the **absolute path** to the directory where you cloned this repository.
+## Example Usage
 
-    ```json
-    {
-      "mcpServers": {
-        "whatsapp": {
-          "command": "node",
-          "args": [
-            "{{PATH_TO_REPO}}/src/main.ts"
-          ],
-          "timeout": 15, // Optional: Adjust startup timeout if needed
-          "disabled": false
-        }
-      }
-    }
-    ```
-    * **Get the absolute path:** Navigate to the `whatsapp-mcp-ts` directory in your terminal and run `pwd`. Use this output for `{{PATH_TO_REPO}}`.
+**You:** Send a message to Dady saying "Good morning!"
 
-2.  **Save the configuration file:**
-    * For **Claude Desktop:** Save the JSON as `claude_desktop_config.json` in its configuration directory:
-        * macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-        * Windows: `%APPDATA%\Claude\claude_desktop_config.json` (Likely path, verify if needed)
-        * Linux: `~/.config/Claude/claude_desktop_config.json` (Likely path, verify if needed)
-    * For **Cursor:** Save the JSON as `mcp.json` in its configuration directory:
-        * `~/.cursor/mcp.json`
+**AI Agent:**
+1. Resolves "Dady" → `919919003141@s.whatsapp.net`
+2. Sends "Good morning!" to that JID
+3. Returns: `Message sent successfully (ID: 3EB0...)`
 
-3.  **Restart Claude Desktop / Cursor:**
-    Close and reopen your AI client. It should now detect the "whatsapp" MCP server and allow you to use its tools.
+**You:** Send my resume to the Family group
 
-## Usage
+**AI Agent:**
+1. Resolves "Family" → finds "Family ❤️" group
+2. Sends the PDF via `send_media`
+3. Returns: `Media sent successfully`
 
-Once the server is running (either manually via `node src/main.ts` or started by the AI client via the config file) and connected to your AI client, you can interact with your WhatsApp data through the agent's chat interface. Ask it to search contacts, list recent chats, read messages, or send messages.
+## Architecture
 
-## Architecture Overview
+```
+┌──────────────────────────────────┐
+│  AI Client (Claude / Cursor)     │
+└──────────┬───────────────────────┘
+           │ stdio (JSON-RPC)
+┌──────────▼───────────────────────┐
+│  MCP Server (src/mcp.ts)         │
+│  13 tools · Zod validation       │
+└─────┬────────────────┬───────────┘
+      │                │
+┌─────▼──────┐  ┌──────▼───────────┐
+│  SQLite DB  │  │  Baileys Socket  │
+│  (node:sql) │  │  (WhatsApp Web)  │
+├────────────┤  ├──────────────────┤
+│ messages   │  │ QR auth          │
+│ chats      │  │ Send/receive     │
+│ contacts   │  │ History sync     │
+└────────────┘  └──────────────────┘
+```
 
-This application is a single Node.js process that:
-
-1.  Uses `@whiskeysockets/baileys` to connect to the WhatsApp Web API, handling authentication and real-time events.
-2.  Stores WhatsApp chats and messages locally in a SQLite database (`./data/whatsapp.db`) using `node:sqlite`.
-3.  Runs an MCP server using `@modelcontextprotocol/sdk` that listens for requests from an AI client over standard input/output (stdio).
-4.  Provides MCP tools that query the local SQLite database or use the Baileys socket to send messages.
-5.  Uses `pino` for logging activity (`wa-logs.txt` for WhatsApp events, `mcp-logs.txt` for MCP server activity).
+- **`src/main.ts`** — Entry point. Initializes DB, WhatsApp, and MCP server.
+- **`src/mcp.ts`** — Defines all MCP tools and handles recipient resolution.
+- **`src/whatsapp.ts`** — Baileys integration: authentication, sending, syncing.
+- **`src/database.ts`** — SQLite schema, message/chat storage and queries.
 
 ## Data Storage & Privacy
 
-* **Authentication:** Your WhatsApp connection credentials are stored locally in the `./auth_info/` directory.
-* **Messages & Chats:** Your message history and chat metadata are stored locally in the `./data/whatsapp.db` SQLite file.
-* **Local Data:** Both `auth_info/` and `data/` are included in `.gitignore` to prevent accidental commits. **Treat these directories as sensitive.**
-* **LLM Interaction:** Data is only sent to the connected Large Language Model (LLM) when the AI agent actively uses one of the provided MCP tools (e.g., `list_messages`, `send_message`). The server itself does not proactively send your data anywhere else.
+| Directory | Contents | Sensitive? |
+|---|---|---|
+| `./auth_info/` | WhatsApp session credentials | Yes — treat as passwords |
+| `./data/whatsapp.db` | All synced messages and chat metadata | Yes — contains personal messages |
+| `./contacts.json` | Cached contact list (fallback for name resolution) | Moderate |
+| `./groups.json` | Cached group list with JIDs | Moderate |
 
-## Technical Details
+All sensitive directories are git-ignored. Your data stays local — it's only sent to the AI when a tool is explicitly invoked.
 
-* **Language:** TypeScript
-* **Runtime:** Node.js (>= v23.10.0)
-* **WhatsApp API:** `@whiskeysockets/baileys`
-* **MCP SDK:** `@modelcontextprotocol/sdk`
-* **Database:** `node:sqlite` (Bundled SQLite)
-* **Logging:** `pino`
-* **Schema Validation:** `zod` (for MCP tool inputs)
+## Logs
+
+Two log files are created at runtime:
+
+- **`wa-logs.txt`** — WhatsApp connection events, QR codes, sync progress
+- **`mcp-logs.txt`** — MCP tool invocations, errors, request details
+
+Set the log level via environment variable:
+```bash
+LOG_LEVEL=debug node src/main.ts  # trace | debug | info | warn | error
+```
 
 ## Troubleshooting
 
-* **QR Code Issues:**
-    * If the QR code link doesn't open automatically, check the console output for the `quickchart.io` URL and open it manually.
-    * Ensure you scan the QR code promptly with your phone's WhatsApp app.
-* **Authentication Failures / Logged Out:**
-    * If the connection closes with a `DisconnectReason.loggedOut` error, you need to re-authenticate. Stop the server, delete the `./auth_info/` directory, and restart the server (`node src/main.ts`) to get a new QR code.
-* **Message Sync Issues:**
-    * Initial sync can take time. Check `wa-logs.txt` for activity.
-    * If messages seem out of sync or missing, you might need a full reset. Stop the server, delete **both** `./auth_info/` and `./data/` directories, then restart the server to re-authenticate and resync history.
-* **MCP Connection Problems (Claude/Cursor):**
-    * Double-check the `command` and `args` (especially the `{{PATH_TO_REPO}}`) in your `claude_desktop_config.json` or `mcp.json`. Ensure the path is absolute and correct.
-    * Verify Node.js are correctly installed and in your system's PATH.
-    * Check the AI client's logs for errors related to starting the MCP server.
-    * Check this server's logs (`mcp-logs.txt`) for MCP-related errors.
-* **Errors Sending Messages:**
-    * Ensure the recipient JID is correct (e.g., `number@s.whatsapp.net` for users, `groupid@g.us` for groups).
-    * Check `wa-logs.txt` for specific errors from Baileys.
-* **General Issues:** Check both `wa-logs.txt` and `mcp-logs.txt` for detailed error messages.
+### QR code doesn't appear
+Check `wa-logs.txt` for the `quickchart.io` URL and open it manually in your browser.
 
-For further MCP integration issues, refer to the [official MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues).
+### "Logged out" or authentication errors
+Delete `./auth_info/` and restart the server to get a fresh QR code:
+```bash
+rm -rf auth_info/
+node src/main.ts
+```
+
+### Messages not syncing
+Initial sync can take several minutes for accounts with large histories. Check `wa-logs.txt` for progress. If messages seem stuck, do a full reset:
+```bash
+rm -rf auth_info/ data/
+node src/main.ts
+```
+
+### MCP tools not showing up in AI client
+1. Verify the path in your config is **absolute** (not relative)
+2. Ensure Node.js 23.10.0+ is in your system PATH
+3. Restart the AI client completely (not just reload)
+4. Check `mcp-logs.txt` for startup errors
+
+### "No contact or group found"
+The name search is case-insensitive but partial — try a more specific name, or use a phone number or JID directly.
+
+### Group messages failing with 406 error
+This can happen with groups where all members use LID-based accounts. The server retries automatically after 2 seconds. If it persists, ensure you're on Baileys v7.0.0-rc.9+.
+
+### Server running old code after changes
+If you're developing and the server doesn't pick up code changes, kill all node processes and restart:
+```bash
+# Find and kill stale processes
+tasklist | findstr node        # Windows
+ps aux | grep node             # macOS/Linux
+
+# Then restart your AI client
+```
+
+## Docker
+
+```bash
+docker build -t whatsapp-mcp .
+docker run -it whatsapp-mcp
+```
+
+Note: You'll need to handle QR code scanning during the initial setup. Mount volumes for `auth_info/` and `data/` to persist sessions:
+```bash
+docker run -it -v ./auth_info:/app/auth_info -v ./data:/app/data whatsapp-mcp
+```
+
+## Tech Stack
+
+- **TypeScript** with ES Modules
+- **Node.js 23.10+** (built-in SQLite via `node:sqlite`)
+- **[@whiskeysockets/baileys](https://github.com/WhiskeySockets/Baileys)** v7 — WhatsApp Web API
+- **[@modelcontextprotocol/sdk](https://github.com/modelcontextprotocol/typescript-sdk)** — MCP server framework
+- **Zod** — input validation
+- **Pino** — structured logging
 
 ## Credits
 
-- https://github.com/lharries/whatsapp-mcp Do the same as this codebase but uses go and python.
+- [whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) — The original Go/Python implementation that inspired this project.
 
 ## License
 
-This project is licensed under the ISC License (see `package.json`).
+ISC
+# elMCP
