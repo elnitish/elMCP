@@ -143,8 +143,8 @@ When using `send_message` or `send_media`, you don't need to know JIDs. The serv
 ```
 "Dady"          → searches contacts by name (case-insensitive)
 "Family"        → searches groups by name (case-insensitive)
-"+91 99190 03141" → converts phone number to JID
-"919919003141@s.whatsapp.net" → uses JID directly
+"+91 991xxxx41" → converts phone number to JID
+"919xxxx41@s.whatsapp.net" → uses JID directly
 ```
 
 If multiple matches are found, you'll get a list to choose from.
@@ -154,7 +154,7 @@ If multiple matches are found, you'll get a list to choose from.
 **You:** Send a message to Dady saying "Good morning!"
 
 **AI Agent:**
-1. Resolves "Dady" → `919919003141@s.whatsapp.net`
+1. Resolves "Dad" → `9919xxxxxx@s.whatsapp.net`
 2. Sends "Good morning!" to that JID
 3. Returns: `Message sent successfully (ID: 3EB0...)`
 
